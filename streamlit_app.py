@@ -1,103 +1,3 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
-import os
-import re
-import tempfile
-import time
-import zipfile
-from datetime import timedelta
-from pathlib import Path
-
-import streamlit as st
-
-
-APP_TITLE = "Transcritor Web EN-PT"
-VERSION = "1.0"
-
-BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
-OUTPUT_DIR = BASE_DIR / "saida_web"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🎧",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-
-def aplicar_estilo():
-    st.markdown(
-        """
-        <style>
-        html, body, [data-testid="stAppViewContainer"] { overflow-y: auto !important; }
-        .block-container {
-            max-width: 1180px;
-            padding: 1.4rem 1rem 5rem 1rem;
-        }
-        h1 { font-size: 1.65rem !important; margin-bottom: .2rem !important; }
-        h2, h3 { letter-spacing: 0 !important; }
-        [data-testid="stHeader"] { background: rgba(255,255,255,.96); }
-        div[data-testid="stMetric"] {
-            background: #f8fafc;
-            border: 1px solid #e5e7eb;
-            border-radius: 8px;
-            padding: .55rem .65rem;
-        }
-        div[data-testid="stAlert"] { border-radius: 8px; }
-        .hero {
-            border: 1px solid #e5e7eb;
-            border-radius: 8px;
-            padding: .9rem 1rem;
-            background: #ffffff;
-            margin: .6rem 0 1rem 0;
-        }
-        .hero strong { display: block; font-size: 1rem; margin-bottom: .2rem; }
-        .hero span { color: #64748b; }
-        .result-card {
-            border: 1px solid #e5e7eb;
-            border-radius: 8px;
-            padding: .85rem;
-            background: #ffffff;
-            margin: .7rem 0;
-        }
-        @media (max-width: 640px) {
-            .block-container { padding: 1rem .55rem 5rem .55rem; }
-            h1 { font-size: 1.25rem !important; line-height: 1.2 !important; }
-            h2 { font-size: 1.08rem !important; }
-            h3 { font-size: 1rem !important; }
-            p, div, span { font-size: .92rem; }
-            div[data-testid="column"] { min-width: 0 !important; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def format_timestamp(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0
-    td = timedelta(seconds=float(seconds))
-    total = int(td.total_seconds())
-    millis = int((float(seconds) - int(float(seconds))) * 1000)
-    hours = total // 3600
-    minutes = (total % 3600) // 60
-    secs = total % 60
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-
-def safe_name(filename: str) -> str:
-    stem = Path(filename).stem
-    name = "".join(ch if ch.isalnum() or ch in " ._-()" else "_" for ch in stem).strip()
-    return name or "audio"
-
-
-def write_txt(path: Path, title: str, lines: list[str]) -> None:
     content = [title, "=" * len(title), ""]
     content.extend(lines)
     path.write_text("\n".join(content).strip() + "\n", encoding="utf-8")
@@ -205,6 +105,18 @@ def instalar_argos_en_pt() -> str:
 
 def translate_lines_argos(lines: list[str]) -> list[str]:
     translator, status = load_argos_translation()
+    if translator is None:
+        st.warning("Pacote de traducao EN-PT ainda nao instalado. Tentando preparar automaticamente...")
+        try:
+            instalar_argos_en_pt()
+            translator, status = load_argos_translation()
+        except Exception as exc:
+            raise RuntimeError(
+                f"{status}\n\n"
+                "Nao foi possivel instalar a traducao automaticamente. "
+                "Tente novamente ou desmarque 'Traduzir para portugues' para gerar apenas a transcricao.\n\n"
+                f"Detalhe: {exc}"
+            ) from exc
     if translator is None:
         raise RuntimeError(status)
     translated: list[str] = []
@@ -335,105 +247,3 @@ def main():
         """,
         unsafe_allow_html=True,
     )
-
-    with st.sidebar:
-        st.header("Configuracao")
-        model_name = st.selectbox("Modelo Whisper", ["tiny", "base", "small", "medium"], index=1)
-        device = st.selectbox("Dispositivo", ["cpu", "cuda"], index=0)
-        compute_type = st.selectbox("Precisao", ["int8", "float16", "float32"], index=0)
-        local_only = st.checkbox("Usar somente modelos ja baixados", value=False)
-        pause_seconds = st.slider("Pausa para paragrafo", 0.5, 5.0, 0.8, 0.1)
-        traduzir = st.checkbox("Traduzir para portugues", value=True)
-
-        translator, argos_status = load_argos_translation()
-        st.caption(argos_status)
-        if translator is None and st.button("Instalar traducao EN-PT"):
-            with st.spinner("Instalando pacote de traducao..."):
-                try:
-                    st.success(instalar_argos_en_pt())
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Nao foi possivel instalar: {exc}")
-
-    uploaded = st.file_uploader(
-        "Envie um audio ou video em ingles",
-        type=["mp3", "wav", "m4a", "aac", "flac", "ogg", "mp4", "mkv", "mov", "avi", "webm"],
-    )
-
-    if uploaded is None:
-        st.info("Escolha um arquivo para comecar.")
-        return
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Arquivo", limpar_texto_tamanho(uploaded.name)[:32])
-    c2.metric("Tamanho", f"{uploaded.size / (1024 * 1024):.1f} MB")
-    c3.metric("Modelo", model_name)
-
-    if not st.button("Transcrever agora", type="primary", use_container_width=True):
-        return
-
-    temp_path: Path | None = None
-    try:
-        temp_path = salvar_upload(uploaded)
-        with st.spinner("Carregando modelo e transcrevendo..."):
-            segments, english_lines, info = transcrever(temp_path, model_name, device, compute_type, local_only)
-
-        portuguese_lines: list[str] | None = None
-        if traduzir:
-            portuguese_lines = translate_lines_argos(english_lines)
-
-        created, preview_pt, preview_en = gerar_arquivos(
-            uploaded.name,
-            segments,
-            english_lines,
-            portuguese_lines,
-            pause_seconds,
-        )
-
-        st.success("Concluido. Arquivos prontos para download.")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Trechos", len(segments))
-        m2.metric("Idioma", getattr(info, "language", "en"))
-        m3.metric("Arquivos", len(created) - 1)
-
-        zip_path = created[0]
-        st.download_button(
-            "Baixar tudo em ZIP",
-            data=zip_path.read_bytes(),
-            file_name=zip_path.name,
-            mime="application/zip",
-            use_container_width=True,
-        )
-
-        tab1, tab2, tab3 = st.tabs(["Portugues", "Ingles", "Arquivos"])
-        with tab1:
-            if preview_pt:
-                st.text_area("Previa da traducao", preview_pt, height=320)
-            else:
-                st.info("Traducao nao gerada nesta execucao.")
-        with tab2:
-            st.text_area("Previa da transcricao", preview_en, height=320)
-        with tab3:
-            for path in created[1:]:
-                mime = "application/octet-stream"
-                if path.suffix == ".txt":
-                    mime = "text/plain"
-                elif path.suffix == ".srt":
-                    mime = "text/plain"
-                elif path.suffix == ".docx":
-                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                st.download_button(path.name, path.read_bytes(), file_name=path.name, mime=mime)
-
-    except Exception as exc:
-        st.error("Nao foi possivel concluir a transcricao.")
-        st.exception(exc)
-    finally:
-        if temp_path and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-
-
-if __name__ == "__main__":
-    main()
