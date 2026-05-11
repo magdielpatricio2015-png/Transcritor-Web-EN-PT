@@ -12,7 +12,7 @@ from faster_whisper import WhisperModel
 
 
 APP_TITLE = "Transcritor"
-VERSION = "v1.0"
+VERSION = "v1.1"
 OUTPUT_DIR = Path("outputs")
 SUPPORTED_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg",
@@ -68,7 +68,7 @@ def salvar_upload(uploaded_file) -> Path:
     suffix = Path(uploaded_file.name).suffix.lower()
 
     if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError(f"Formato nao suportado: {suffix}")
+        raise ValueError(f"Formato não suportado: {suffix}")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
@@ -108,29 +108,32 @@ def transcrever(
     return segmentos, linhas, info
 
 
-def load_argos_translation():
+@st.cache_resource(show_spinner=False)
+def garantir_argos_en_pt() -> str:
+    """
+    Garante que o Argos Translate e o pacote inglês -> português estejam disponíveis.
+
+    Em ambientes como JetHub/Streamlit Cloud, o sistema pode reiniciar sem manter
+    pacotes baixados manualmente. Por isso esta função verifica e instala quando necessário.
+    """
     try:
         import argostranslate.package
         import argostranslate.translate
-    except ImportError:
-        return None, "Argos Translate nao esta instalado."
+    except ImportError as exc:
+        raise RuntimeError(
+            "Argos Translate não está instalado. Adicione 'argostranslate' no requirements.txt."
+        ) from exc
 
     installed_languages = argostranslate.translate.get_installed_languages()
     from_lang = next((lang for lang in installed_languages if lang.code == "en"), None)
     to_lang = next((lang for lang in installed_languages if lang.code == "pt"), None)
 
-    if from_lang is None or to_lang is None:
-        return None, "Pacote de traducao EN -> PT ainda nao instalado."
-
-    translator = from_lang.get_translation(to_lang)
-    return translator, "Traducao EN -> PT disponivel."
-
-
-def instalar_argos_en_pt() -> str:
-    try:
-        import argostranslate.package
-    except ImportError as exc:
-        raise RuntimeError("Instale primeiro: pip install argostranslate") from exc
+    if from_lang is not None and to_lang is not None:
+        try:
+            from_lang.get_translation(to_lang)
+            return "Tradução EN -> PT já disponível."
+        except Exception:
+            pass
 
     argostranslate.package.update_package_index()
     available_packages = argostranslate.package.get_available_packages()
@@ -144,19 +147,45 @@ def instalar_argos_en_pt() -> str:
     )
 
     if package is None:
-        raise RuntimeError("Pacote EN -> PT nao encontrado no indice do Argos.")
+        raise RuntimeError("Pacote EN -> PT não encontrado no índice do Argos.")
 
     package_path = package.download()
     argostranslate.package.install_from_path(package_path)
-    return "Pacote de traducao EN -> PT instalado com sucesso."
+
+    return "Pacote de tradução EN -> PT instalado com sucesso."
+
+
+def load_argos_translation():
+    try:
+        import argostranslate.translate
+    except ImportError:
+        return None, "Argos Translate não está instalado."
+
+    installed_languages = argostranslate.translate.get_installed_languages()
+    from_lang = next((lang for lang in installed_languages if lang.code == "en"), None)
+    to_lang = next((lang for lang in installed_languages if lang.code == "pt"), None)
+
+    if from_lang is None or to_lang is None:
+        return None, "Pacote de tradução EN -> PT ainda não instalado."
+
+    try:
+        translator = from_lang.get_translation(to_lang)
+    except Exception:
+        return None, "Pacote de tradução EN -> PT encontrado, mas não pôde ser carregado."
+
+    return translator, "Tradução EN -> PT disponível."
+
+
+def instalar_argos_en_pt() -> str:
+    garantir_argos_en_pt.clear()
+    return garantir_argos_en_pt()
 
 
 def translate_lines_argos(lines: Iterable[str]) -> list[str]:
     translator, status = load_argos_translation()
+
     if translator is None:
-        raise RuntimeError(
-            f"{status} Clique em 'Instalar traducao EN-PT' na barra lateral ou desative a traducao."
-        )
+        raise RuntimeError(status)
 
     translated: list[str] = []
     for line in lines:
@@ -228,16 +257,16 @@ def write_docx(
 ) -> None:
     doc = Document()
 
-    doc.add_heading("Transcricao e traducao", level=1)
+    doc.add_heading("Transcrição e tradução", level=1)
     doc.add_paragraph(f"Arquivo original: {source_name}")
     doc.add_paragraph(f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
 
     if portuguese_paragraphs:
-        doc.add_heading("Traducao em portugues", level=2)
+        doc.add_heading("Tradução em português", level=2)
         for paragraph in portuguese_paragraphs:
             doc.add_paragraph(paragraph)
 
-    doc.add_heading("Transcricao em ingles", level=2)
+    doc.add_heading("Transcrição em inglês", level=2)
     for paragraph in english_paragraphs:
         doc.add_paragraph(paragraph)
 
@@ -275,12 +304,12 @@ def gerar_arquivos(
     created: list[Path] = []
 
     english_txt = out_dir / f"{base}_transcricao_en.txt"
-    write_txt(english_txt, "Transcricao em ingles", english_paragraphs)
+    write_txt(english_txt, "Transcrição em inglês", english_paragraphs)
     created.append(english_txt)
 
     if portuguese_paragraphs is not None:
         pt_txt = out_dir / f"{base}_traducao_pt.txt"
-        write_txt(pt_txt, "Traducao em portugues", portuguese_paragraphs)
+        write_txt(pt_txt, "Tradução em português", portuguese_paragraphs)
         created.append(pt_txt)
 
     en_srt = out_dir / f"{base}_legenda_en.srt"
@@ -314,11 +343,11 @@ def main() -> None:
     aplicar_estilo()
 
     st.title(f"{APP_TITLE} {VERSION}")
-    st.caption("Transcricao de audio/video em ingles, traducao para portugues e geracao de legenda.")
+    st.caption("Transcrição de áudio/vídeo em inglês, tradução para português e geração de legenda.")
     st.markdown(
         """
         <div class="hero">
-            <strong>Primeira versao online do seu transcritor</strong>
+            <strong>Transcritor online com instalação automática da tradução</strong>
             <span>Envie um arquivo, transcreva, traduza e baixe TXT, SRT, Word e ZIP.</span>
         </div>
         """,
@@ -326,32 +355,41 @@ def main() -> None:
     )
 
     with st.sidebar:
-        st.header("Configuracao")
+        st.header("Configuração")
         model_name = st.selectbox("Modelo Whisper", ["tiny", "base", "small", "medium"], index=1)
         device = st.selectbox("Dispositivo", ["cpu", "cuda"], index=0)
-        compute_type = st.selectbox("Precisao", ["int8", "float16", "float32"], index=0)
-        local_only = st.checkbox("Usar somente modelos ja baixados", value=False)
-        pause_seconds = st.slider("Pausa para paragrafo", 0.5, 5.0, 0.8, 0.1)
-        traduzir = st.checkbox("Traduzir para portugues", value=True)
+        compute_type = st.selectbox("Precisão", ["int8", "float16", "float32"], index=0)
+        local_only = st.checkbox("Usar somente modelos já baixados", value=False)
+        pause_seconds = st.slider("Pausa para parágrafo", 0.5, 5.0, 0.8, 0.1)
+        traduzir = st.checkbox("Traduzir para português", value=True)
+        instalar_auto = st.checkbox("Instalar tradução EN-PT automaticamente", value=True)
+
+        if traduzir and instalar_auto:
+            try:
+                with st.spinner("Verificando tradução EN -> PT..."):
+                    status_auto = garantir_argos_en_pt()
+                st.caption(status_auto)
+            except Exception as exc:
+                st.warning(f"Tradução automática indisponível: {exc}")
 
         translator, argos_status = load_argos_translation()
         st.caption(argos_status)
 
-        if translator is None and st.button("Instalar traducao EN-PT"):
-            with st.spinner("Instalando pacote de traducao..."):
+        if translator is None and st.button("Instalar tradução EN-PT"):
+            with st.spinner("Instalando pacote de tradução..."):
                 try:
                     st.success(instalar_argos_en_pt())
                     st.rerun()
                 except Exception as exc:
-                    st.error(f"Nao foi possivel instalar: {exc}")
+                    st.error(f"Não foi possível instalar: {exc}")
 
     uploaded = st.file_uploader(
-        "Envie um audio ou video em ingles",
+        "Envie um áudio ou vídeo em inglês",
         type=["mp3", "wav", "m4a", "aac", "flac", "ogg", "mp4", "mkv", "mov", "avi", "webm"],
     )
 
     if uploaded is None:
-        st.info("Escolha um arquivo para comecar.")
+        st.info("Escolha um arquivo para começar.")
         return
 
     c1, c2, c3 = st.columns(3)
@@ -377,10 +415,19 @@ def main() -> None:
             )
 
         portuguese_lines: list[str] | None = None
+        traducao_falhou = False
 
         if traduzir:
-            with st.spinner("Traduzindo para portugues..."):
-                portuguese_lines = translate_lines_argos(english_lines)
+            with st.spinner("Traduzindo para português..."):
+                try:
+                    portuguese_lines = translate_lines_argos(english_lines)
+                except Exception as exc:
+                    traducao_falhou = True
+                    portuguese_lines = None
+                    st.warning(
+                        "A transcrição foi concluída, mas a tradução não pôde ser gerada. "
+                        f"Motivo: {exc}"
+                    )
 
         created, preview_pt, preview_en = gerar_arquivos(
             uploaded.name,
@@ -390,7 +437,10 @@ def main() -> None:
             pause_seconds,
         )
 
-        st.success("Concluido. Arquivos prontos para download.")
+        if traducao_falhou:
+            st.success("Transcrição concluída. Arquivos em inglês prontos para download.")
+        else:
+            st.success("Concluído. Arquivos prontos para download.")
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Trechos", len(segments))
@@ -406,16 +456,16 @@ def main() -> None:
             use_container_width=True,
         )
 
-        tab1, tab2, tab3 = st.tabs(["Portugues", "Ingles", "Arquivos"])
+        tab1, tab2, tab3 = st.tabs(["Português", "Inglês", "Arquivos"])
 
         with tab1:
             if preview_pt:
-                st.text_area("Previa da traducao", preview_pt, height=320)
+                st.text_area("Prévia da tradução", preview_pt, height=320)
             else:
-                st.info("Traducao nao gerada nesta execucao.")
+                st.info("Tradução não gerada nesta execução.")
 
         with tab2:
-            st.text_area("Previa da transcricao", preview_en, height=320)
+            st.text_area("Prévia da transcrição", preview_en, height=320)
 
         with tab3:
             for path in created[1:]:
@@ -434,7 +484,7 @@ def main() -> None:
                 )
 
     except Exception as exc:
-        st.error("Nao foi possivel concluir a transcricao.")
+        st.error("Não foi possível concluir a transcrição.")
         st.exception(exc)
 
     finally:
