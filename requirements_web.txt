@@ -1,0 +1,5 @@
+streamlit
+faster-whisper
+argostranslate
+python-docx
+huggingface-hub
