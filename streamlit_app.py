@@ -1,5 +1,6 @@
 import re
 import base64
+import html
 import shutil
 import tempfile
 import zipfile
@@ -50,6 +51,14 @@ class Segmento:
     start: float
     end: float
     text: str
+
+
+class LegendasYouTubeDisponiveis(Exception):
+    def __init__(self, source_name: str, segments: list[Segmento], lines: list[str]) -> None:
+        super().__init__("Usei legendas do YouTube como alternativa ao audio.")
+        self.source_name = source_name
+        self.segments = segments
+        self.lines = lines
 
 
 def aplicar_estilo() -> None:
@@ -207,6 +216,122 @@ def explicar_erro_ytdlp(error_text: str, youtube: bool) -> str:
     return "O site recusou ou bloqueou o download do link."
 
 
+def segundos_vtt(valor: str) -> float:
+    partes = valor.replace(",", ".").split(":")
+
+    if len(partes) == 3:
+        horas, minutos, segundos = partes
+        return int(horas) * 3600 + int(minutos) * 60 + float(segundos)
+
+    if len(partes) == 2:
+        minutos, segundos = partes
+        return int(minutos) * 60 + float(segundos)
+
+    return float(partes[0])
+
+
+def limpar_linha_vtt(texto: str) -> str:
+    texto = re.sub(r"<[^>]+>", "", texto)
+    texto = re.sub(r"\{\\.*?\}", "", texto)
+    texto = html.unescape(texto)
+    return limpar_texto(texto)
+
+
+def parse_vtt(vtt_text: str) -> tuple[list[Segmento], list[str]]:
+    segmentos: list[Segmento] = []
+    linhas: list[str] = []
+    blocos = re.split(r"\n\s*\n", vtt_text.replace("\r\n", "\n"))
+
+    for bloco in blocos:
+        bloco_linhas = [linha.strip() for linha in bloco.split("\n") if linha.strip()]
+        tempo_index = next((i for i, linha in enumerate(bloco_linhas) if "-->" in linha), None)
+
+        if tempo_index is None:
+            continue
+
+        tempo = bloco_linhas[tempo_index]
+        match = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{3})\s+-->\s+(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{3})", tempo)
+
+        if not match:
+            continue
+
+        texto = " ".join(limpar_linha_vtt(linha) for linha in bloco_linhas[tempo_index + 1 :])
+        texto = limpar_texto(texto)
+
+        if not texto:
+            continue
+
+        if linhas and texto == linhas[-1]:
+            continue
+
+        start = segundos_vtt(match.group(1))
+        end = segundos_vtt(match.group(2))
+        segmentos.append(Segmento(start=start, end=end, text=texto))
+        linhas.append(texto)
+
+    return segmentos, linhas
+
+
+def escolher_legenda(captions: dict) -> dict | None:
+    idiomas_preferidos = ("en", "en-US", "en-GB", "en-CA", "en-AU")
+
+    for idioma in idiomas_preferidos:
+        opcoes = captions.get(idioma)
+
+        if not opcoes:
+            continue
+
+        return next((opcao for opcao in opcoes if opcao.get("ext") == "vtt"), opcoes[0])
+
+    idioma_en = next((idioma for idioma in captions if idioma.startswith("en")), None)
+
+    if idioma_en:
+        opcoes = captions[idioma_en]
+        return next((opcao for opcao in opcoes if opcao.get("ext") == "vtt"), opcoes[0])
+
+    return None
+
+
+def extrair_legendas_youtube(url: str) -> tuple[str, list[Segmento], list[str]]:
+    try:
+        import requests
+        from yt_dlp import YoutubeDL
+    except ImportError as exc:
+        raise RuntimeError("Instale 'requests' e 'yt-dlp' no requirements.txt.") from exc
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+
+    cookiefile = preparar_cookiefile(Path(tempfile.mkdtemp(prefix="transcritor_cookies_")))
+
+    if cookiefile is not None:
+        ydl_opts["cookiefile"] = str(cookiefile)
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    captions = info.get("subtitles") or {}
+    automatic_captions = info.get("automatic_captions") or {}
+    legenda = escolher_legenda(captions) or escolher_legenda(automatic_captions)
+
+    if legenda is None or not legenda.get("url"):
+        raise RuntimeError("Nao encontrei legenda em ingles para usar como alternativa.")
+
+    response = requests.get(legenda["url"], timeout=60)
+    response.raise_for_status()
+
+    segments, lines = parse_vtt(response.text)
+
+    if not segments:
+        raise RuntimeError("A legenda foi encontrada, mas nao consegui converter em texto.")
+
+    source_name = limpar_texto(info.get("title") or "legendas_youtube")
+    return source_name, segments, lines
+
+
 def cookies_disponiveis() -> bool:
     return (
         COOKIES_FILE.exists()
@@ -306,11 +431,18 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
                 ) from exc
 
     if info is None:
-        raise RuntimeError(
-            "O YouTube abriu o video, mas nao entregou nenhum formato com audio para baixar. "
-            "Tente outro video, use upload manual, ou baixe o audio fora do Streamlit e envie o arquivo.\n\n"
-            f"Detalhe tecnico do yt-dlp: {ultimo_erro}"
-        )
+        try:
+            source_name, segments, lines = extrair_legendas_youtube(url)
+        except Exception as exc:
+            raise RuntimeError(
+                "O YouTube abriu o video, mas nao entregou nenhum formato com audio para baixar. "
+                "Tambem nao consegui usar legendas automaticas. Tente outro video, use upload manual, "
+                "ou baixe o audio fora do Streamlit e envie o arquivo.\n\n"
+                f"Detalhe tecnico do yt-dlp: {ultimo_erro}\n"
+                f"Detalhe das legendas: {exc}"
+            ) from exc
+
+        raise LegendasYouTubeDisponiveis(source_name, segments, lines)
 
     arquivos = [path for path in temp_dir.iterdir() if path.is_file()]
 
@@ -693,6 +825,8 @@ def main() -> None:
     temp_path: Path | None = None
     temp_dir_link: Path | None = None
     source_name = ""
+    segments: list[Segmento] | None = None
+    english_lines: list[str] | None = None
 
     try:
         if modo_entrada == "Enviar arquivo":
@@ -700,16 +834,26 @@ def main() -> None:
             source_name = uploaded.name
         else:
             with st.spinner("Baixando midia do link..."):
-                temp_path, source_name, temp_dir_link = baixar_midia_link(link_midia)
+                try:
+                    temp_path, source_name, temp_dir_link = baixar_midia_link(link_midia)
+                except LegendasYouTubeDisponiveis as exc:
+                    source_name = exc.source_name
+                    segments = exc.segments
+                    english_lines = exc.lines
+                    st.warning(
+                        "Nao consegui baixar o audio desse video. Usei as legendas do YouTube "
+                        "como alternativa para gerar os arquivos."
+                    )
 
-        with st.spinner("Carregando modelo e transcrevendo..."):
-            segments, english_lines, _info = transcrever(
-                temp_path,
-                model_name,
-                device,
-                compute_type,
-                local_only,
-            )
+        if segments is None or english_lines is None:
+            with st.spinner("Carregando modelo e transcrevendo..."):
+                segments, english_lines, _info = transcrever(
+                    temp_path,
+                    model_name,
+                    device,
+                    compute_type,
+                    local_only,
+                )
 
         portuguese_lines: list[str] | None = None
         traducao_falhou = False
