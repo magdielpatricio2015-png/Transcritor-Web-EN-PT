@@ -311,7 +311,7 @@ def extrair_legendas_youtube(url: str) -> tuple[str, list[Segmento], list[str]]:
         ydl_opts["cookiefile"] = str(cookiefile)
 
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        info = ydl.extract_info(url, download=False, process=False)
 
     captions = info.get("subtitles") or {}
     automatic_captions = info.get("automatic_captions") or {}
