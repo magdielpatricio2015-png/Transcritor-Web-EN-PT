@@ -2,6 +2,7 @@ import re
 import base64
 import html
 import shutil
+import time
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -281,12 +282,36 @@ def escolher_legenda(captions: dict) -> dict | None:
         if not opcoes:
             continue
 
+        vtt_sem_traducao = next(
+            (
+                opcao
+                for opcao in opcoes
+                if opcao.get("ext") == "vtt" and "tlang=" not in opcao.get("url", "")
+            ),
+            None,
+        )
+
+        if vtt_sem_traducao:
+            return vtt_sem_traducao
+
         return next((opcao for opcao in opcoes if opcao.get("ext") == "vtt"), opcoes[0])
 
     idioma_en = next((idioma for idioma in captions if idioma.startswith("en")), None)
 
     if idioma_en:
         opcoes = captions[idioma_en]
+        vtt_sem_traducao = next(
+            (
+                opcao
+                for opcao in opcoes
+                if opcao.get("ext") == "vtt" and "tlang=" not in opcao.get("url", "")
+            ),
+            None,
+        )
+
+        if vtt_sem_traducao:
+            return vtt_sem_traducao
+
         return next((opcao for opcao in opcoes if opcao.get("ext") == "vtt"), opcoes[0])
 
     return None
@@ -320,8 +345,33 @@ def extrair_legendas_youtube(url: str) -> tuple[str, list[Segmento], list[str]]:
     if legenda is None or not legenda.get("url"):
         raise RuntimeError("Nao encontrei legenda em ingles para usar como alternativa.")
 
-    response = requests.get(legenda["url"], timeout=60)
-    response.raise_for_status()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/vtt,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
+        "Referer": "https://www.youtube.com/",
+    }
+
+    ultimo_erro_legenda = None
+
+    for tentativa in range(3):
+        try:
+            response = requests.get(legenda["url"], headers=headers, timeout=60)
+            response.raise_for_status()
+            break
+        except requests.HTTPError as exc:
+            ultimo_erro_legenda = exc
+
+            if response.status_code != 429 or tentativa == 2:
+                raise
+
+            time.sleep(2 + tentativa * 3)
+    else:
+        raise ultimo_erro_legenda
 
     segments, lines = parse_vtt(response.text)
 
