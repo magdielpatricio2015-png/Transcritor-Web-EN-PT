@@ -14,7 +14,7 @@ from faster_whisper import WhisperModel
 
 
 APP_TITLE = "Transcritor"
-VERSION = "v1.3"
+VERSION = "v1.4"
 OUTPUT_DIR = Path("outputs")
 
 SUPPORTED_EXTENSIONS = {
@@ -99,18 +99,68 @@ def url_valida(url: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
-    """
-    Baixa áudio/vídeo de um link usando yt-dlp.
+def baixar_link_direto(url: str, temp_dir: Path) -> tuple[Path, str]:
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError(
+            "requests não está instalado. Adicione 'requests' no requirements.txt."
+        ) from exc
 
-    Retorna:
-    - caminho do arquivo baixado
-    - nome amigável da fonte
-    - diretório temporário para limpeza posterior
-    """
-    if not url_valida(url):
-        raise ValueError("Informe um link válido começando com http:// ou https://.")
+    parsed = urlparse(url.strip())
+    suffix = Path(parsed.path).suffix.lower()
 
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise ValueError("O link não parece apontar diretamente para um arquivo suportado.")
+
+    original_name = Path(parsed.path).name or f"audio{suffix}"
+    base_name = nome_seguro(original_name)
+    file_path = temp_dir / f"{base_name}{suffix}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    try:
+        with requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=60,
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "").lower()
+
+            if "text/html" in content_type:
+                raise RuntimeError(
+                    "O link abriu uma página HTML, não um arquivo de mídia direto."
+                )
+
+            with file_path.open("wb") as file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        file.write(chunk)
+
+    except Exception as exc:
+        raise RuntimeError(
+            "Não foi possível baixar o arquivo direto. "
+            "Verifique se o link é público e aponta diretamente para .mp3, .mp4, .wav, .m4a etc."
+        ) from exc
+
+    if not file_path.exists() or file_path.stat().st_size == 0:
+        raise RuntimeError("O arquivo baixado está vazio.")
+
+    return file_path, original_name
+
+
+def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
     try:
         from yt_dlp import YoutubeDL
         from yt_dlp.utils import DownloadError
@@ -119,13 +169,10 @@ def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
             "yt-dlp não está instalado. Adicione 'yt-dlp' no requirements.txt."
         ) from exc
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="transcritor_link_"))
-
     ydl_opts = {
         "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
         "outtmpl": str(temp_dir / "%(title).200B.%(ext)s"),
         "noplaylist": True,
-
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -136,12 +183,10 @@ def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
             "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
             "Referer": "https://www.youtube.com/",
         },
-
         "concurrent_fragment_downloads": 1,
         "retries": 5,
         "fragment_retries": 5,
         "socket_timeout": 30,
-
         "quiet": True,
         "no_warnings": True,
     }
@@ -151,22 +196,17 @@ def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
             info = ydl.extract_info(url, download=True)
 
     except DownloadError as exc:
-        shutil.rmtree(temp_dir, ignore_errors=True)
         raise RuntimeError(
             "O site recusou o download do link. "
-            "Isso pode acontecer por bloqueio 403, vídeo privado, restrição regional, "
-            "login obrigatório ou bloqueio do servidor do Streamlit. "
-            "Tente outro link, um link direto para .mp3/.mp4, ou envie o arquivo manualmente."
+            "Isso normalmente acontece com YouTube, Instagram, TikTok, Facebook "
+            "ou sites que exigem login. No Streamlit Cloud, essas plataformas podem "
+            "bloquear o servidor. Use um link direto para .mp3/.mp4/.m4a/.wav "
+            "ou envie o arquivo manualmente."
         ) from exc
-
-    except Exception:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise
 
     arquivos = [p for p in temp_dir.iterdir() if p.is_file()]
 
     if not arquivos:
-        shutil.rmtree(temp_dir, ignore_errors=True)
         raise RuntimeError("Nenhum arquivo foi baixado a partir do link.")
 
     arquivo_baixado = max(arquivos, key=lambda path: path.stat().st_size)
@@ -174,7 +214,35 @@ def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
     source_name = info.get("title") or arquivo_baixado.name
     source_name = limpar_texto_tamanho(source_name)
 
-    return arquivo_baixado, source_name, temp_dir
+    return arquivo_baixado, source_name
+
+
+def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
+    """
+    Baixa áudio/vídeo de um link.
+
+    Primeiro tenta como link direto de arquivo.
+    Se não for link direto, tenta com yt-dlp.
+    """
+    if not url_valida(url):
+        raise ValueError("Informe um link válido começando com http:// ou https://.")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="transcritor_link_"))
+
+    try:
+        parsed = urlparse(url.strip())
+        suffix = Path(parsed.path).suffix.lower()
+
+        if suffix in SUPPORTED_EXTENSIONS:
+            file_path, source_name = baixar_link_direto(url, temp_dir)
+            return file_path, source_name, temp_dir
+
+        file_path, source_name = baixar_com_ytdlp(url, temp_dir)
+        return file_path, source_name, temp_dir
+
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
 
 def transcrever(
@@ -220,9 +288,6 @@ def transcrever(
 
 @st.cache_resource(show_spinner=False)
 def garantir_argos_en_pt() -> str:
-    """
-    Garante que o Argos Translate e o pacote inglês -> português estejam disponíveis.
-    """
     try:
         import argostranslate.package
         import argostranslate.translate
@@ -492,7 +557,7 @@ def main() -> None:
         """
         <div class="hero">
             <strong>Transcritor online com suporte a arquivo ou link</strong>
-            <span>Envie um arquivo ou cole um link, transcreva, traduza e baixe TXT, SRT, Word e ZIP.</span>
+            <span>Envie um arquivo ou cole um link direto de mídia para transcrever, traduzir e baixar TXT, SRT, Word e ZIP.</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -595,12 +660,13 @@ def main() -> None:
     else:
         link_midia = st.text_input(
             "Cole o link do áudio ou vídeo",
-            placeholder="https://www.youtube.com/watch?v=...",
+            placeholder="https://exemplo.com/audio.mp3",
         )
 
         st.caption(
-            "Links diretos .mp3/.mp4 costumam funcionar melhor. "
-            "YouTube, Instagram, TikTok e Facebook podem bloquear servidores cloud."
+            "Links diretos para .mp3, .mp4, .wav, .m4a, .aac, .flac, .ogg ou .webm "
+            "funcionam melhor. YouTube, Instagram, TikTok e Facebook podem bloquear "
+            "servidores cloud."
         )
 
         if not link_midia.strip():
@@ -645,92 +711,4 @@ def main() -> None:
                 try:
                     portuguese_lines = translate_lines_argos(english_lines)
 
-                except Exception as exc:
-                    traducao_falhou = True
-                    portuguese_lines = None
-
-                    st.warning(
-                        "A transcrição foi concluída, mas a tradução não pôde ser gerada. "
-                        f"Motivo: {exc}"
-                    )
-
-        created, preview_pt, preview_en = gerar_arquivos(
-            source_name,
-            segments,
-            english_lines,
-            portuguese_lines,
-            pause_seconds,
-        )
-
-        if traducao_falhou:
-            st.success("Transcrição concluída. Arquivos em inglês prontos para download.")
-        else:
-            st.success("Concluído. Arquivos prontos para download.")
-
-        m1, m2, m3 = st.columns(3)
-
-        m1.metric("Trechos", len(segments))
-        m2.metric("Idioma", getattr(info, "language", "en"))
-        m3.metric("Arquivos", len(created) - 1)
-
-        zip_path = created[0]
-
-        st.download_button(
-            "Baixar tudo em ZIP",
-            data=zip_path.read_bytes(),
-            file_name=zip_path.name,
-            mime="application/zip",
-            use_container_width=True,
-        )
-
-        tab1, tab2, tab3 = st.tabs(["Português", "Inglês", "Arquivos"])
-
-        with tab1:
-            if preview_pt:
-                st.text_area("Prévia da tradução", preview_pt, height=320)
-            else:
-                st.info("Tradução não gerada nesta execução.")
-
-        with tab2:
-            st.text_area("Prévia da transcrição", preview_en, height=320)
-
-        with tab3:
-            for path in created[1:]:
-                mime = "application/octet-stream"
-
-                if path.suffix in {".txt", ".srt"}:
-                    mime = "text/plain"
-
-                elif path.suffix == ".docx":
-                    mime = (
-                        "application/vnd.openxmlformats-officedocument."
-                        "wordprocessingml.document"
-                    )
-
-                st.download_button(
-                    label=path.name,
-                    data=path.read_bytes(),
-                    file_name=path.name,
-                    mime=mime,
-                )
-
-    except Exception as exc:
-        st.error("Não foi possível concluir a transcrição.")
-        st.exception(exc)
-
-    finally:
-        if temp_path and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-
-        if temp_dir_link and temp_dir_link.exists():
-            try:
-                shutil.rmtree(temp_dir_link)
-            except OSError:
-                pass
-
-
-if __name__ == "__main__":
-    main()
+                except Exception
