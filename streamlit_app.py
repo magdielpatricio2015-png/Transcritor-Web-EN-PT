@@ -14,7 +14,7 @@ from faster_whisper import WhisperModel
 
 
 APP_TITLE = "Transcritor"
-VERSION = "v1.2"
+VERSION = "v1.3"
 OUTPUT_DIR = Path("outputs")
 
 SUPPORTED_EXTENSIONS = {
@@ -72,6 +72,17 @@ def carregar_modelo(
     )
 
 
+def limpar_texto_tamanho(nome: str) -> str:
+    return re.sub(r"\s+", " ", nome).strip()
+
+
+def nome_seguro(nome: str) -> str:
+    stem = Path(nome).stem
+    stem = re.sub(r"[^\w\-. ]+", "", stem, flags=re.UNICODE)
+    stem = re.sub(r"\s+", "_", stem).strip("._-")
+    return stem or "transcricao"
+
+
 def salvar_upload(uploaded_file) -> Path:
     suffix = Path(uploaded_file.name).suffix.lower()
 
@@ -102,6 +113,7 @@ def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
 
     try:
         from yt_dlp import YoutubeDL
+        from yt_dlp.utils import DownloadError
     except ImportError as exc:
         raise RuntimeError(
             "yt-dlp não está instalado. Adicione 'yt-dlp' no requirements.txt."
@@ -110,9 +122,26 @@ def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
     temp_dir = Path(tempfile.mkdtemp(prefix="transcritor_link_"))
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
         "outtmpl": str(temp_dir / "%(title).200B.%(ext)s"),
         "noplaylist": True,
+
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
+            "Referer": "https://www.youtube.com/",
+        },
+
+        "concurrent_fragment_downloads": 1,
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 30,
+
         "quiet": True,
         "no_warnings": True,
     }
@@ -120,6 +149,16 @@ def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
+
+    except DownloadError as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError(
+            "O site recusou o download do link. "
+            "Isso pode acontecer por bloqueio 403, vídeo privado, restrição regional, "
+            "login obrigatório ou bloqueio do servidor do Streamlit. "
+            "Tente outro link, um link direto para .mp3/.mp4, ou envie o arquivo manualmente."
+        ) from exc
+
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
@@ -159,6 +198,7 @@ def transcrever(
 
     for segment in raw_segments:
         texto = segment.text.strip()
+
         if not texto:
             continue
 
@@ -169,6 +209,7 @@ def transcrever(
                 text=texto,
             )
         )
+
         linhas.append(texto)
 
     if not segmentos:
@@ -181,9 +222,6 @@ def transcrever(
 def garantir_argos_en_pt() -> str:
     """
     Garante que o Argos Translate e o pacote inglês -> português estejam disponíveis.
-
-    Em ambientes como JetHub/Streamlit Cloud, o sistema pode reiniciar sem manter
-    pacotes baixados manualmente. Por isso esta função verifica e instala quando necessário.
     """
     try:
         import argostranslate.package
@@ -194,8 +232,16 @@ def garantir_argos_en_pt() -> str:
         ) from exc
 
     installed_languages = argostranslate.translate.get_installed_languages()
-    from_lang = next((lang for lang in installed_languages if lang.code == "en"), None)
-    to_lang = next((lang for lang in installed_languages if lang.code == "pt"), None)
+
+    from_lang = next(
+        (lang for lang in installed_languages if lang.code == "en"),
+        None,
+    )
+
+    to_lang = next(
+        (lang for lang in installed_languages if lang.code == "pt"),
+        None,
+    )
 
     if from_lang is not None and to_lang is not None:
         try:
@@ -232,8 +278,16 @@ def load_argos_translation():
         return None, "Argos Translate não está instalado."
 
     installed_languages = argostranslate.translate.get_installed_languages()
-    from_lang = next((lang for lang in installed_languages if lang.code == "en"), None)
-    to_lang = next((lang for lang in installed_languages if lang.code == "pt"), None)
+
+    from_lang = next(
+        (lang for lang in installed_languages if lang.code == "en"),
+        None,
+    )
+
+    to_lang = next(
+        (lang for lang in installed_languages if lang.code == "pt"),
+        None,
+    )
 
     if from_lang is None or to_lang is None:
         return None, "Pacote de tradução EN -> PT ainda não instalado."
@@ -293,10 +347,13 @@ def agrupar_paragrafos(
 
 def format_srt_time(seconds: float) -> str:
     milliseconds = int(round(seconds * 1000))
+
     hours = milliseconds // 3_600_000
     milliseconds %= 3_600_000
+
     minutes = milliseconds // 60_000
     milliseconds %= 60_000
+
     secs = milliseconds // 1000
     millis = milliseconds % 1000
 
@@ -342,22 +399,16 @@ def write_docx(
 
     if portuguese_paragraphs:
         doc.add_heading("Tradução em português", level=2)
+
         for paragraph in portuguese_paragraphs:
             doc.add_paragraph(paragraph)
 
     doc.add_heading("Transcrição em inglês", level=2)
+
     for paragraph in english_paragraphs:
         doc.add_paragraph(paragraph)
 
     doc.save(path)
-
-
-def nome_seguro(nome: str) -> str:
-    stem = Path(nome).stem
-    stem = re.sub(r"[^\w\-. ]+", "", stem, flags=re.UNICODE)
-    stem = re.sub(r"\s+", "_", stem).strip("._-")
-
-    return stem or "transcricao"
 
 
 def gerar_arquivos(
@@ -371,10 +422,15 @@ def gerar_arquivos(
 
     base = nome_seguro(source_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     out_dir = OUTPUT_DIR / f"{base}_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    english_paragraphs = agrupar_paragrafos(segments, english_lines, pause_seconds)
+    english_paragraphs = agrupar_paragrafos(
+        segments,
+        english_lines,
+        pause_seconds,
+    )
 
     portuguese_paragraphs = (
         agrupar_paragrafos(segments, portuguese_lines, pause_seconds)
@@ -403,7 +459,12 @@ def gerar_arquivos(
         created.append(pt_srt)
 
     docx_path = out_dir / f"{base}_transcricao_traducao.docx"
-    write_docx(docx_path, source_name, english_paragraphs, portuguese_paragraphs)
+    write_docx(
+        docx_path,
+        source_name,
+        english_paragraphs,
+        portuguese_paragraphs,
+    )
     created.append(docx_path)
 
     zip_path = out_dir / f"{base}_resultado.zip"
@@ -418,14 +479,11 @@ def gerar_arquivos(
     return [zip_path] + created, preview_pt, preview_en
 
 
-def limpar_texto_tamanho(nome: str) -> str:
-    return re.sub(r"\s+", " ", nome).strip()
-
-
 def main() -> None:
     aplicar_estilo()
 
     st.title(f"{APP_TITLE} {VERSION}")
+
     st.caption(
         "Transcrição de áudio/vídeo em inglês, tradução para português e geração de legenda."
     )
@@ -488,7 +546,9 @@ def main() -> None:
             try:
                 with st.spinner("Verificando tradução EN -> PT..."):
                     status_auto = garantir_argos_en_pt()
+
                 st.caption(status_auto)
+
             except Exception as exc:
                 st.warning(f"Tradução automática indisponível: {exc}")
 
@@ -500,6 +560,7 @@ def main() -> None:
                 try:
                     st.success(instalar_argos_en_pt())
                     st.rerun()
+
                 except Exception as exc:
                     st.error(f"Não foi possível instalar: {exc}")
 
@@ -526,6 +587,7 @@ def main() -> None:
             return
 
         c1, c2, c3 = st.columns(3)
+
         c1.metric("Arquivo", limpar_texto_tamanho(uploaded.name)[:32])
         c2.metric("Tamanho", f"{uploaded.size / (1024 * 1024):.1f} MB")
         c3.metric("Modelo", model_name)
@@ -536,11 +598,17 @@ def main() -> None:
             placeholder="https://www.youtube.com/watch?v=...",
         )
 
+        st.caption(
+            "Links diretos .mp3/.mp4 costumam funcionar melhor. "
+            "YouTube, Instagram, TikTok e Facebook podem bloquear servidores cloud."
+        )
+
         if not link_midia.strip():
             st.info("Cole um link para começar.")
             return
 
         c1, c2 = st.columns(2)
+
         c1.metric("Origem", "Link")
         c2.metric("Modelo", model_name)
 
@@ -555,6 +623,7 @@ def main() -> None:
         if modo_entrada == "Enviar arquivo":
             temp_path = salvar_upload(uploaded)
             source_name = uploaded.name
+
         else:
             with st.spinner("Baixando mídia do link..."):
                 temp_path, source_name, temp_dir_link = baixar_midia_link(link_midia)
@@ -575,9 +644,11 @@ def main() -> None:
             with st.spinner("Traduzindo para português..."):
                 try:
                     portuguese_lines = translate_lines_argos(english_lines)
+
                 except Exception as exc:
                     traducao_falhou = True
                     portuguese_lines = None
+
                     st.warning(
                         "A transcrição foi concluída, mas a tradução não pôde ser gerada. "
                         f"Motivo: {exc}"
@@ -597,6 +668,7 @@ def main() -> None:
             st.success("Concluído. Arquivos prontos para download.")
 
         m1, m2, m3 = st.columns(3)
+
         m1.metric("Trechos", len(segments))
         m2.metric("Idioma", getattr(info, "language", "en"))
         m3.metric("Arquivos", len(created) - 1)
@@ -628,6 +700,7 @@ def main() -> None:
 
                 if path.suffix in {".txt", ".srt"}:
                     mime = "text/plain"
+
                 elif path.suffix == ".docx":
                     mime = (
                         "application/vnd.openxmlformats-officedocument."
