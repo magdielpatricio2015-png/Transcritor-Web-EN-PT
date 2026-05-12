@@ -3,3 +3,4 @@ python-docx
 faster-whisper
 argostranslate
 yt-dlp>=2024.12.13
+requests
