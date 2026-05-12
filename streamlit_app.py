@@ -1,4 +1,5 @@
 import re
+import base64
 import shutil
 import tempfile
 import zipfile
@@ -17,6 +18,8 @@ APP_TITLE = "Transcritor EN-PT"
 VERSION = "v2.0"
 OUTPUT_DIR = Path("outputs")
 COOKIES_FILE = Path("cookies.txt")
+SECRET_COOKIES_KEY = "YOUTUBE_COOKIES"
+SECRET_COOKIES_B64_KEY = "YOUTUBE_COOKIES_B64"
 
 SUPPORTED_EXTENSIONS = {
     ".mp3",
@@ -204,6 +207,39 @@ def explicar_erro_ytdlp(error_text: str, youtube: bool) -> str:
     return "O site recusou ou bloqueou o download do link."
 
 
+def cookies_disponiveis() -> bool:
+    return (
+        COOKIES_FILE.exists()
+        or bool(st.secrets.get(SECRET_COOKIES_KEY, "").strip())
+        or bool(st.secrets.get(SECRET_COOKIES_B64_KEY, "").strip())
+    )
+
+
+def preparar_cookiefile(temp_dir: Path) -> Path | None:
+    secret_cookies = st.secrets.get(SECRET_COOKIES_KEY, "").strip()
+    secret_cookies_b64 = st.secrets.get(SECRET_COOKIES_B64_KEY, "").strip()
+
+    if secret_cookies:
+        cookie_path = temp_dir / "youtube_cookies.txt"
+        cookie_path.write_text(secret_cookies, encoding="utf-8")
+        return cookie_path
+
+    if secret_cookies_b64:
+        try:
+            decoded = base64.b64decode(secret_cookies_b64).decode("utf-8")
+        except Exception as exc:
+            raise RuntimeError("YOUTUBE_COOKIES_B64 esta invalido nos Secrets do Streamlit.") from exc
+
+        cookie_path = temp_dir / "youtube_cookies.txt"
+        cookie_path.write_text(decoded, encoding="utf-8")
+        return cookie_path
+
+    if COOKIES_FILE.exists():
+        return COOKIES_FILE
+
+    return None
+
+
 def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
     try:
         from yt_dlp import YoutubeDL
@@ -233,8 +269,10 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
         },
     }
 
-    if COOKIES_FILE.exists():
-        ydl_opts["cookiefile"] = str(COOKIES_FILE)
+    cookiefile = preparar_cookiefile(temp_dir)
+
+    if cookiefile is not None:
+        ydl_opts["cookiefile"] = str(cookiefile)
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -515,8 +553,8 @@ def mostrar_ajuda_youtube() -> None:
         <div class="status-box">
             <strong>Sobre links do YouTube</strong><br>
             O app tenta usar yt-dlp. Se o YouTube bloquear o servidor, use upload manual
-            ou adicione cookies.txt na raiz do projeto. Links diretos para arquivos .mp3
-            ou .mp4 costumam funcionar sem cookies.
+            ou configure YOUTUBE_COOKIES_B64 nos secrets do Streamlit. Links diretos para
+            arquivos .mp3 ou .mp4 costumam funcionar sem cookies.
         </div>
         """,
         unsafe_allow_html=True,
@@ -602,10 +640,13 @@ def main() -> None:
         mostrar_ajuda_youtube()
 
         if link_midia.strip() and eh_youtube(link_midia):
-            if COOKIES_FILE.exists():
-                st.success("cookies.txt encontrado. O app vai tentar usar esses cookies no YouTube.")
+            if cookies_disponiveis():
+                st.success("Cookies encontrados. O app vai tentar usar esses cookies no YouTube.")
             else:
-                st.warning("YouTube detectado. Sem cookies.txt, o Streamlit Cloud pode ser bloqueado.")
+                st.warning(
+                    "YouTube detectado. Sem YOUTUBE_COOKIES_B64 nos secrets, "
+                    "o Streamlit Cloud pode ser bloqueado."
+                )
 
         if not link_midia.strip():
             st.info("Cole um link para comecar.")
@@ -613,7 +654,7 @@ def main() -> None:
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Origem", "YouTube" if eh_youtube(link_midia) else "Link")
-        c2.metric("Cookies", "Sim" if COOKIES_FILE.exists() else "Nao")
+        c2.metric("Cookies", "Sim" if cookies_disponiveis() else "Nao")
         c3.metric("Modelo", model_name)
 
     if not st.button("Transcrever agora", type="primary", use_container_width=True):
