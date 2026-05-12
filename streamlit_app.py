@@ -14,7 +14,7 @@ from faster_whisper import WhisperModel
 
 
 APP_TITLE = "Transcritor"
-VERSION = "v1.4"
+VERSION = "v1.5"
 OUTPUT_DIR = Path("outputs")
 
 SUPPORTED_EXTENSIONS = {
@@ -111,9 +111,9 @@ def baixar_link_direto(url: str, temp_dir: Path) -> tuple[Path, str]:
     suffix = Path(parsed.path).suffix.lower()
 
     if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError("O link não parece apontar diretamente para um arquivo suportado.")
+        raise ValueError("O link não aponta diretamente para um arquivo suportado.")
 
-    original_name = Path(parsed.path).name or f"audio{suffix}"
+    original_name = Path(parsed.path).name or f"midia{suffix}"
     base_name = nome_seguro(original_name)
     file_path = temp_dir / f"{base_name}{suffix}"
 
@@ -140,7 +140,7 @@ def baixar_link_direto(url: str, temp_dir: Path) -> tuple[Path, str]:
 
             if "text/html" in content_type:
                 raise RuntimeError(
-                    "O link abriu uma página HTML, não um arquivo de mídia direto."
+                    "O link retornou uma página HTML, não um arquivo de mídia direto."
                 )
 
             with file_path.open("wb") as file:
@@ -151,7 +151,8 @@ def baixar_link_direto(url: str, temp_dir: Path) -> tuple[Path, str]:
     except Exception as exc:
         raise RuntimeError(
             "Não foi possível baixar o arquivo direto. "
-            "Verifique se o link é público e aponta diretamente para .mp3, .mp4, .wav, .m4a etc."
+            "Verifique se o link é público e aponta diretamente para "
+            ".mp3, .mp4, .wav, .m4a, .aac, .flac, .ogg ou .webm."
         ) from exc
 
     if not file_path.exists() or file_path.stat().st_size == 0:
@@ -181,7 +182,6 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
             ),
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
-            "Referer": "https://www.youtube.com/",
         },
         "concurrent_fragment_downloads": 1,
         "retries": 5,
@@ -198,10 +198,9 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
     except DownloadError as exc:
         raise RuntimeError(
             "O site recusou o download do link. "
-            "Isso normalmente acontece com YouTube, Instagram, TikTok, Facebook "
-            "ou sites que exigem login. No Streamlit Cloud, essas plataformas podem "
-            "bloquear o servidor. Use um link direto para .mp3/.mp4/.m4a/.wav "
-            "ou envie o arquivo manualmente."
+            "Isso é comum em YouTube, Instagram, TikTok, Facebook ou sites que exigem login. "
+            "No Streamlit Cloud, essas plataformas podem bloquear o servidor. "
+            "Use um link direto de arquivo ou envie o arquivo manualmente."
         ) from exc
 
     arquivos = [p for p in temp_dir.iterdir() if p.is_file()]
@@ -218,12 +217,6 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
 
 
 def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
-    """
-    Baixa áudio/vídeo de um link.
-
-    Primeiro tenta como link direto de arquivo.
-    Se não for link direto, tenta com yt-dlp.
-    """
     if not url_valida(url):
         raise ValueError("Informe um link válido começando com http:// ou https://.")
 
@@ -711,4 +704,92 @@ def main() -> None:
                 try:
                     portuguese_lines = translate_lines_argos(english_lines)
 
-                except Exception
+                except Exception as exc:
+                    traducao_falhou = True
+                    portuguese_lines = None
+
+                    st.warning(
+                        "A transcrição foi concluída, mas a tradução não pôde ser gerada. "
+                        f"Motivo: {exc}"
+                    )
+
+        created, preview_pt, preview_en = gerar_arquivos(
+            source_name,
+            segments,
+            english_lines,
+            portuguese_lines,
+            pause_seconds,
+        )
+
+        if traducao_falhou:
+            st.success("Transcrição concluída. Arquivos em inglês prontos para download.")
+        else:
+            st.success("Concluído. Arquivos prontos para download.")
+
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric("Trechos", len(segments))
+        m2.metric("Idioma", getattr(info, "language", "en"))
+        m3.metric("Arquivos", len(created) - 1)
+
+        zip_path = created[0]
+
+        st.download_button(
+            "Baixar tudo em ZIP",
+            data=zip_path.read_bytes(),
+            file_name=zip_path.name,
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+        tab1, tab2, tab3 = st.tabs(["Português", "Inglês", "Arquivos"])
+
+        with tab1:
+            if preview_pt:
+                st.text_area("Prévia da tradução", preview_pt, height=320)
+            else:
+                st.info("Tradução não gerada nesta execução.")
+
+        with tab2:
+            st.text_area("Prévia da transcrição", preview_en, height=320)
+
+        with tab3:
+            for path in created[1:]:
+                mime = "application/octet-stream"
+
+                if path.suffix in {".txt", ".srt"}:
+                    mime = "text/plain"
+
+                elif path.suffix == ".docx":
+                    mime = (
+                        "application/vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document"
+                    )
+
+                st.download_button(
+                    label=path.name,
+                    data=path.read_bytes(),
+                    file_name=path.name,
+                    mime=mime,
+                )
+
+    except Exception as exc:
+        st.error("Não foi possível concluir a transcrição.")
+        st.exception(exc)
+
+    finally:
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+        if temp_dir_link and temp_dir_link.exists():
+            try:
+                shutil.rmtree(temp_dir_link)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()
