@@ -247,8 +247,7 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
     except ImportError as exc:
         raise RuntimeError("Instale 'yt-dlp' no requirements.txt.") from exc
 
-    ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
+    base_opts = {
         "outtmpl": str(temp_dir / "%(title).200B.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -257,7 +256,6 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
         "fragment_retries": 5,
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 1,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -272,15 +270,47 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
     cookiefile = preparar_cookiefile(temp_dir)
 
     if cookiefile is not None:
-        ydl_opts["cookiefile"] = str(cookiefile)
+        base_opts["cookiefile"] = str(cookiefile)
 
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except DownloadError as exc:
-        error_text = str(exc)
-        explanation = explicar_erro_ytdlp(error_text, eh_youtube(url))
-        raise RuntimeError(f"{explanation}\n\nDetalhe tecnico do yt-dlp: {error_text}") from exc
+    tentativas = [
+        {
+            "format": "bestaudio/best",
+            "extractor_args": {"youtube": {"player_client": ["web"]}},
+        },
+        {
+            "format": "best[acodec!=none]/best",
+            "extractor_args": {"youtube": {"player_client": ["web"]}},
+        },
+        {
+            "format": "best",
+        },
+    ]
+
+    info = None
+    ultimo_erro = ""
+
+    for tentativa in tentativas:
+        ydl_opts = {**base_opts, **tentativa}
+
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                break
+        except DownloadError as exc:
+            ultimo_erro = str(exc)
+
+            if "Requested format is not available" not in ultimo_erro:
+                explanation = explicar_erro_ytdlp(ultimo_erro, eh_youtube(url))
+                raise RuntimeError(
+                    f"{explanation}\n\nDetalhe tecnico do yt-dlp: {ultimo_erro}"
+                ) from exc
+
+    if info is None:
+        raise RuntimeError(
+            "O YouTube abriu o video, mas nao entregou nenhum formato com audio para baixar. "
+            "Tente outro video, use upload manual, ou baixe o audio fora do Streamlit e envie o arquivo.\n\n"
+            f"Detalhe tecnico do yt-dlp: {ultimo_erro}"
+        )
 
     arquivos = [path for path in temp_dir.iterdir() if path.is_file()]
 
