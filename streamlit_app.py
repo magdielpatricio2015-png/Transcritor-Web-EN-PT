@@ -12,7 +12,6 @@ import streamlit as st
 from docx import Document
 from faster_whisper import WhisperModel
 
-
 APP_TITLE = "Transcritor"
 VERSION = "v1.5"
 OUTPUT_DIR = Path("outputs")
@@ -21,6 +20,8 @@ SUPPORTED_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus",
     ".mp4", ".mkv", ".mov", ".avi", ".webm",
 }
+
+COOKIES_FILE = Path("cookies.txt")  # opcional, para sites como YouTube
 
 
 @dataclass
@@ -191,16 +192,23 @@ def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
         "no_warnings": True,
     }
 
+    # Usa cookies se o arquivo existir (útil no Streamlit Cloud para YouTube)
+    if COOKIES_FILE.exists():
+        ydl_opts["cookiefile"] = str(COOKIES_FILE)
+
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
     except DownloadError as exc:
         raise RuntimeError(
-            "O site recusou o download do link. "
-            "Isso é comum em YouTube, Instagram, TikTok, Facebook ou sites que exigem login. "
-            "No Streamlit Cloud, essas plataformas podem bloquear o servidor. "
-            "Use um link direto de arquivo ou envie o arquivo manualmente."
+            "O site recusou o download do link (YouTube, Instagram, TikTok, etc.). "
+            "No Streamlit Cloud esses bloqueios são comuns.\n\n"
+            "Soluções:\n"
+            "1) Use um link direto de arquivo.\n"
+            "2) Faça o upload manual do arquivo.\n"
+            "3) Coloque um arquivo 'cookies.txt' (exportado do seu navegador) "
+            "na raiz do projeto e reinicie o app."
         ) from exc
 
     arquivos = [p for p in temp_dir.iterdir() if p.is_file()]
@@ -657,9 +665,10 @@ def main() -> None:
         )
 
         st.caption(
-            "Links diretos para .mp3, .mp4, .wav, .m4a, .aac, .flac, .ogg ou .webm "
-            "funcionam melhor. YouTube, Instagram, TikTok e Facebook podem bloquear "
-            "servidores cloud."
+            "⚠️ Sites como YouTube, Instagram, TikTok e Facebook frequentemente "
+            "bloqueiam servidores em cloud. Para usar esses links no Streamlit Cloud, "
+            "adicione um arquivo `cookies.txt` (exportado do navegador) na raiz do projeto. "
+            "Links diretos para arquivos de mídia funcionam sem restrições."
         )
 
         if not link_midia.strip():
@@ -709,86 +718,64 @@ def main() -> None:
                     portuguese_lines = None
 
                     st.warning(
-                        "A transcrição foi concluída, mas a tradução não pôde ser gerada. "
-                        f"Motivo: {exc}"
+                        "A transcrição foi concluída, mas a tradução não pôde "
+                        "ser realizada. Você ainda pode baixar a transcrição em inglês."
                     )
 
-        created, preview_pt, preview_en = gerar_arquivos(
-            source_name,
-            segments,
-            english_lines,
-            portuguese_lines,
-            pause_seconds,
-        )
+        # Geração dos arquivos e previews
+        with st.spinner("Gerando arquivos..."):
+            files, preview_pt, preview_en = gerar_arquivos(
+                source_name,
+                segments,
+                english_lines,
+                portuguese_lines,
+                pause_seconds,
+            )
 
-        if traducao_falhou:
-            st.success("Transcrição concluída. Arquivos em inglês prontos para download.")
-        else:
-            st.success("Concluído. Arquivos prontos para download.")
-
-        m1, m2, m3 = st.columns(3)
-
-        m1.metric("Trechos", len(segments))
-        m2.metric("Idioma", getattr(info, "language", "en"))
-        m3.metric("Arquivos", len(created) - 1)
-
-        zip_path = created[0]
-
-        st.download_button(
-            "Baixar tudo em ZIP",
-            data=zip_path.read_bytes(),
-            file_name=zip_path.name,
-            mime="application/zip",
-            use_container_width=True,
-        )
-
-        tab1, tab2, tab3 = st.tabs(["Português", "Inglês", "Arquivos"])
+        # Exibição da prévia
+        tab1, tab2 = st.tabs(["🇧🇷 Português", "🇬🇧 Inglês"])
 
         with tab1:
-            if preview_pt:
-                st.text_area("Prévia da tradução", preview_pt, height=320)
+            if portuguese_lines and not traducao_falhou:
+                st.text_area(
+                    "Tradução",
+                    preview_pt,
+                    height=300,
+                )
             else:
-                st.info("Tradução não gerada nesta execução.")
+                st.info("Tradução indisponível.")
 
         with tab2:
-            st.text_area("Prévia da transcrição", preview_en, height=320)
+            st.text_area(
+                "Transcrição original",
+                preview_en,
+                height=300,
+            )
 
-        with tab3:
-            for path in created[1:]:
-                mime = "application/octet-stream"
+        # Download
+        st.success("Processamento concluído! Baixe os arquivos abaixo.")
 
-                if path.suffix in {".txt", ".srt"}:
-                    mime = "text/plain"
-
-                elif path.suffix == ".docx":
-                    mime = (
-                        "application/vnd.openxmlformats-officedocument."
-                        "wordprocessingml.document"
-                    )
-
+        for file_path in files:
+            with file_path.open("rb") as f:
                 st.download_button(
-                    label=path.name,
-                    data=path.read_bytes(),
-                    file_name=path.name,
-                    mime=mime,
+                    label=f"⬇️ {file_path.name}",
+                    data=f,
+                    file_name=file_path.name,
+                    mime="application/octet-stream",
                 )
 
     except Exception as exc:
-        st.error("Não foi possível concluir a transcrição.")
-        st.exception(exc)
+        st.error(f"Erro: {exc}")
 
     finally:
+        # Limpeza dos arquivos temporários
         if temp_path and temp_path.exists():
             try:
                 temp_path.unlink()
-            except OSError:
+            except Exception:
                 pass
-
         if temp_dir_link and temp_dir_link.exists():
-            try:
-                shutil.rmtree(temp_dir_link)
-            except OSError:
-                pass
+            shutil.rmtree(temp_dir_link, ignore_errors=True)
 
 
 if __name__ == "__main__":
