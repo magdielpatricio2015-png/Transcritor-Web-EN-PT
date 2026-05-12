@@ -1,637 +1,14 @@
-import re
-import shutil
-import tempfile
-import zipfile
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Iterable
-from urllib.parse import urlparse
-
-import streamlit as st
-from docx import Document
-from faster_whisper import WhisperModel
-
-APP_TITLE = "Transcritor"
-VERSION = "v1.5"
-OUTPUT_DIR = Path("outputs")
-
-SUPPORTED_EXTENSIONS = {
-    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus",
-    ".mp4", ".mkv", ".mov", ".avi", ".webm",
-}
-
-COOKIES_FILE = Path("cookies.txt")  # opcional, para sites como YouTube
-
-
-@dataclass
-class Segmento:
-    start: float
-    end: float
-    text: str
-
-
-def aplicar_estilo() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🎙️", layout="wide")
-
-    st.markdown(
-        """
-        <style>
-            .hero {
-                padding: 1rem 1.25rem;
-                border-radius: 14px;
-                background: linear-gradient(135deg, #111827, #1f2937);
-                color: white;
-                margin-bottom: 1rem;
-            }
-            .hero strong {
-                display: block;
-                font-size: 1.05rem;
-                margin-bottom: .25rem;
-            }
-            .hero span {
-                color: #d1d5db;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-@st.cache_resource(show_spinner=False)
-def carregar_modelo(
-    model_name: str,
-    device: str,
-    compute_type: str,
-    local_only: bool,
-) -> WhisperModel:
-    return WhisperModel(
-        model_name,
-        device=device,
-        compute_type=compute_type,
-        local_files_only=local_only,
-    )
-
-
-def limpar_texto_tamanho(nome: str) -> str:
-    return re.sub(r"\s+", " ", nome).strip()
-
-
-def nome_seguro(nome: str) -> str:
-    stem = Path(nome).stem
-    stem = re.sub(r"[^\w\-. ]+", "", stem, flags=re.UNICODE)
-    stem = re.sub(r"\s+", "_", stem).strip("._-")
-    return stem or "transcricao"
-
-
-def salvar_upload(uploaded_file) -> Path:
-    suffix = Path(uploaded_file.name).suffix.lower()
-
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError(f"Formato não suportado: {suffix}")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        return Path(tmp.name)
-
-
-def url_valida(url: str) -> bool:
-    parsed = urlparse(url.strip())
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def baixar_link_direto(url: str, temp_dir: Path) -> tuple[Path, str]:
-    try:
-        import requests
-    except ImportError as exc:
-        raise RuntimeError(
-            "requests não está instalado. Adicione 'requests' no requirements.txt."
-        ) from exc
-
-    parsed = urlparse(url.strip())
-    suffix = Path(parsed.path).suffix.lower()
-
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError("O link não aponta diretamente para um arquivo suportado.")
-
-    original_name = Path(parsed.path).name or f"midia{suffix}"
-    base_name = nome_seguro(original_name)
-    file_path = temp_dir / f"{base_name}{suffix}"
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-    }
-
-    try:
-        with requests.get(
-            url,
-            headers=headers,
-            stream=True,
-            timeout=60,
-            allow_redirects=True,
-        ) as response:
-            response.raise_for_status()
-
-            content_type = response.headers.get("content-type", "").lower()
-
-            if "text/html" in content_type:
-                raise RuntimeError(
-                    "O link retornou uma página HTML, não um arquivo de mídia direto."
-                )
-
-            with file_path.open("wb") as file:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        file.write(chunk)
-
-    except Exception as exc:
-        raise RuntimeError(
-            "Não foi possível baixar o arquivo direto. "
-            "Verifique se o link é público e aponta diretamente para "
-            ".mp3, .mp4, .wav, .m4a, .aac, .flac, .ogg ou .webm."
-        ) from exc
-
-    if not file_path.exists() or file_path.stat().st_size == 0:
-        raise RuntimeError("O arquivo baixado está vazio.")
-
-    return file_path, original_name
-
-
-def baixar_com_ytdlp(url: str, temp_dir: Path) -> tuple[Path, str]:
-    try:
-        from yt_dlp import YoutubeDL
-        from yt_dlp.utils import DownloadError
-    except ImportError as exc:
-        raise RuntimeError(
-            "yt-dlp não está instalado. Adicione 'yt-dlp' no requirements.txt."
-        ) from exc
-
-    ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
-        "outtmpl": str(temp_dir / "%(title).200B.%(ext)s"),
-        "noplaylist": True,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
-        },
-        "concurrent_fragment_downloads": 1,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 30,
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    # Usa cookies se o arquivo existir (útil no Streamlit Cloud para YouTube)
-    if COOKIES_FILE.exists():
-        ydl_opts["cookiefile"] = str(COOKIES_FILE)
-
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-    except DownloadError as exc:
-        raise RuntimeError(
-            "O site recusou o download do link (YouTube, Instagram, TikTok, etc.). "
-            "No Streamlit Cloud esses bloqueios são comuns.\n\n"
-            "Soluções:\n"
-            "1) Use um link direto de arquivo.\n"
-            "2) Faça o upload manual do arquivo.\n"
-            "3) Coloque um arquivo 'cookies.txt' (exportado do seu navegador) "
-            "na raiz do projeto e reinicie o app."
-        ) from exc
-
-    arquivos = [p for p in temp_dir.iterdir() if p.is_file()]
-
-    if not arquivos:
-        raise RuntimeError("Nenhum arquivo foi baixado a partir do link.")
-
-    arquivo_baixado = max(arquivos, key=lambda path: path.stat().st_size)
-
-    source_name = info.get("title") or arquivo_baixado.name
-    source_name = limpar_texto_tamanho(source_name)
-
-    return arquivo_baixado, source_name
-
-
-def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
-    if not url_valida(url):
-        raise ValueError("Informe um link válido começando com http:// ou https://.")
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="transcritor_link_"))
-
-    try:
-        parsed = urlparse(url.strip())
-        suffix = Path(parsed.path).suffix.lower()
-
-        if suffix in SUPPORTED_EXTENSIONS:
-            file_path, source_name = baixar_link_direto(url, temp_dir)
-            return file_path, source_name, temp_dir
-
-        file_path, source_name = baixar_com_ytdlp(url, temp_dir)
-        return file_path, source_name, temp_dir
-
-    except Exception:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise
-
-
-def transcrever(
-    audio_path: Path,
-    model_name: str,
-    device: str,
-    compute_type: str,
-    local_only: bool,
-) -> tuple[list[Segmento], list[str], object]:
-    model = carregar_modelo(model_name, device, compute_type, local_only)
-
-    raw_segments, info = model.transcribe(
-        str(audio_path),
-        language="en",
-        vad_filter=True,
-        beam_size=5,
-    )
-
-    segmentos: list[Segmento] = []
-    linhas: list[str] = []
-
-    for segment in raw_segments:
-        texto = segment.text.strip()
-
-        if not texto:
-            continue
-
-        segmentos.append(
-            Segmento(
-                start=float(segment.start),
-                end=float(segment.end),
-                text=texto,
-            )
-        )
-
-        linhas.append(texto)
-
-    if not segmentos:
-        raise RuntimeError("Nenhum trecho de fala foi detectado no arquivo.")
-
-    return segmentos, linhas, info
-
-
-@st.cache_resource(show_spinner=False)
-def garantir_argos_en_pt() -> str:
-    try:
-        import argostranslate.package
-        import argostranslate.translate
-    except ImportError as exc:
-        raise RuntimeError(
-            "Argos Translate não está instalado. Adicione 'argostranslate' no requirements.txt."
-        ) from exc
-
-    installed_languages = argostranslate.translate.get_installed_languages()
-
-    from_lang = next(
-        (lang for lang in installed_languages if lang.code == "en"),
-        None,
-    )
-
-    to_lang = next(
-        (lang for lang in installed_languages if lang.code == "pt"),
-        None,
-    )
-
-    if from_lang is not None and to_lang is not None:
-        try:
-            from_lang.get_translation(to_lang)
-            return "Tradução EN -> PT já disponível."
-        except Exception:
-            pass
-
-    argostranslate.package.update_package_index()
-    available_packages = argostranslate.package.get_available_packages()
-
-    package = next(
-        (
-            pkg
-            for pkg in available_packages
-            if pkg.from_code == "en" and pkg.to_code == "pt"
-        ),
-        None,
-    )
-
-    if package is None:
-        raise RuntimeError("Pacote EN -> PT não encontrado no índice do Argos.")
-
-    package_path = package.download()
-    argostranslate.package.install_from_path(package_path)
-
-    return "Pacote de tradução EN -> PT instalado com sucesso."
-
-
-def load_argos_translation():
-    try:
-        import argostranslate.translate
-    except ImportError:
-        return None, "Argos Translate não está instalado."
-
-    installed_languages = argostranslate.translate.get_installed_languages()
-
-    from_lang = next(
-        (lang for lang in installed_languages if lang.code == "en"),
-        None,
-    )
-
-    to_lang = next(
-        (lang for lang in installed_languages if lang.code == "pt"),
-        None,
-    )
-
-    if from_lang is None or to_lang is None:
-        return None, "Pacote de tradução EN -> PT ainda não instalado."
-
-    try:
-        translator = from_lang.get_translation(to_lang)
-    except Exception:
-        return None, "Pacote de tradução EN -> PT encontrado, mas não pôde ser carregado."
-
-    return translator, "Tradução EN -> PT disponível."
-
-
-def instalar_argos_en_pt() -> str:
-    garantir_argos_en_pt.clear()
-    return garantir_argos_en_pt()
-
-
-def translate_lines_argos(lines: Iterable[str]) -> list[str]:
-    translator, status = load_argos_translation()
-
-    if translator is None:
-        raise RuntimeError(status)
-
-    translated: list[str] = []
-
-    for line in lines:
-        translated.append(translator.translate(line).strip())
-
-    return translated
-
-
-def agrupar_paragrafos(
-    segments: list[Segmento],
-    lines: list[str],
-    pause_seconds: float,
-) -> list[str]:
-    if not segments or not lines:
-        return []
-
-    paragraphs: list[str] = []
-    current: list[str] = [lines[0]]
-
-    for index in range(1, min(len(segments), len(lines))):
-        pause = segments[index].start - segments[index - 1].end
-
-        if pause >= pause_seconds:
-            paragraphs.append(" ".join(current).strip())
-            current = [lines[index]]
-        else:
-            current.append(lines[index])
-
-    if current:
-        paragraphs.append(" ".join(current).strip())
-
-    return paragraphs
-
-
-def format_srt_time(seconds: float) -> str:
-    milliseconds = int(round(seconds * 1000))
-
-    hours = milliseconds // 3_600_000
-    milliseconds %= 3_600_000
-
-    minutes = milliseconds // 60_000
-    milliseconds %= 60_000
-
-    secs = milliseconds // 1000
-    millis = milliseconds % 1000
-
-    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
-
-
-def write_srt(
-    path: Path,
-    segments: list[Segmento],
-    lines: list[str] | None = None,
-) -> None:
-    with path.open("w", encoding="utf-8") as file:
-        for index, segment in enumerate(segments, start=1):
-            text = lines[index - 1] if lines and index - 1 < len(lines) else segment.text
-
-            file.write(f"{index}\n")
-            file.write(
-                f"{format_srt_time(segment.start)} --> "
-                f"{format_srt_time(segment.end)}\n"
-            )
-            file.write(f"{text.strip()}\n\n")
-
-
-def write_txt(path: Path, title: str, paragraphs: list[str]) -> None:
-    with path.open("w", encoding="utf-8") as file:
-        file.write(f"{title}\n")
-        file.write("=" * len(title))
-        file.write("\n\n")
-        file.write("\n\n".join(paragraphs))
-
-
-def write_docx(
-    path: Path,
-    source_name: str,
-    english_paragraphs: list[str],
-    portuguese_paragraphs: list[str] | None,
-) -> None:
-    doc = Document()
-
-    doc.add_heading("Transcrição e tradução", level=1)
-    doc.add_paragraph(f"Arquivo original: {source_name}")
-    doc.add_paragraph(f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-
-    if portuguese_paragraphs:
-        doc.add_heading("Tradução em português", level=2)
-
-        for paragraph in portuguese_paragraphs:
-            doc.add_paragraph(paragraph)
-
-    doc.add_heading("Transcrição em inglês", level=2)
-
-    for paragraph in english_paragraphs:
-        doc.add_paragraph(paragraph)
-
-    doc.save(path)
-
-
-def gerar_arquivos(
-    source_name: str,
-    segments: list[Segmento],
-    english_lines: list[str],
-    portuguese_lines: list[str] | None,
-    pause_seconds: float,
-) -> tuple[list[Path], str, str]:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    base = nome_seguro(source_name)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    out_dir = OUTPUT_DIR / f"{base}_{timestamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    english_paragraphs = agrupar_paragrafos(
-        segments,
-        english_lines,
-        pause_seconds,
-    )
-
-    portuguese_paragraphs = (
-        agrupar_paragrafos(segments, portuguese_lines, pause_seconds)
-        if portuguese_lines is not None
-        else None
-    )
-
-    created: list[Path] = []
-
-    english_txt = out_dir / f"{base}_transcricao_en.txt"
-    write_txt(english_txt, "Transcrição em inglês", english_paragraphs)
-    created.append(english_txt)
-
-    if portuguese_paragraphs is not None:
-        pt_txt = out_dir / f"{base}_traducao_pt.txt"
-        write_txt(pt_txt, "Tradução em português", portuguese_paragraphs)
-        created.append(pt_txt)
-
-    en_srt = out_dir / f"{base}_legenda_en.srt"
-    write_srt(en_srt, segments)
-    created.append(en_srt)
-
-    if portuguese_lines is not None:
-        pt_srt = out_dir / f"{base}_legenda_pt.srt"
-        write_srt(pt_srt, segments, portuguese_lines)
-        created.append(pt_srt)
-
-    docx_path = out_dir / f"{base}_transcricao_traducao.docx"
-    write_docx(
-        docx_path,
-        source_name,
-        english_paragraphs,
-        portuguese_paragraphs,
-    )
-    created.append(docx_path)
-
-    zip_path = out_dir / f"{base}_resultado.zip"
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in created:
-            zf.write(path, arcname=path.name)
-
-    preview_pt = "\n\n".join(portuguese_paragraphs or [])
-    preview_en = "\n\n".join(english_paragraphs)
-
-    return [zip_path] + created, preview_pt, preview_en
-
-
-def main() -> None:
-    aplicar_estilo()
-
-    st.title(f"{APP_TITLE} {VERSION}")
-
-    st.caption(
-        "Transcrição de áudio/vídeo em inglês, tradução para português e geração de legenda."
-    )
-
-    st.markdown(
-        """
-        <div class="hero">
-            <strong>Transcritor online com suporte a arquivo ou link</strong>
-            <span>Envie um arquivo ou cole um link direto de mídia para transcrever, traduzir e baixar TXT, SRT, Word e ZIP.</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.sidebar:
-        st.header("Configuração")
-
-        model_name = st.selectbox(
-            "Modelo Whisper",
-            ["tiny", "base", "small", "medium"],
-            index=1,
-        )
-
-        device = st.selectbox(
-            "Dispositivo",
-            ["cpu", "cuda"],
-            index=0,
-        )
-
-        compute_type = st.selectbox(
-            "Precisão",
-            ["int8", "float16", "float32"],
-            index=0,
-        )
-
-        local_only = st.checkbox(
-            "Usar somente modelos já baixados",
-            value=False,
-        )
-
-        pause_seconds = st.slider(
-            "Pausa para parágrafo",
-            0.5,
-            5.0,
-            0.8,
-            0.1,
-        )
-
-        traduzir = st.checkbox(
-            "Traduzir para português",
-            value=True,
-        )
-
-        instalar_auto = st.checkbox(
-            "Instalar tradução EN-PT automaticamente",
-            value=True,
-        )
-
-        if traduzir and instalar_auto:
-            try:
-                with st.spinner("Verificando tradução EN -> PT..."):
-                    status_auto = garantir_argos_en_pt()
-
-                st.caption(status_auto)
-
-            except Exception as exc:
-                st.warning(f"Tradução automática indisponível: {exc}")
-
         translator, argos_status = load_argos_translation()
         st.caption(argos_status)
 
-        if translator is None and st.button("Instalar tradução EN-PT"):
-            with st.spinner("Instalando pacote de tradução..."):
-                try:
-                    st.success(instalar_argos_en_pt())
-                    st.rerun()
-
-                except Exception as exc:
-                    st.error(f"Não foi possível instalar: {exc}")
+        if translator is None and st.button("Instalar traducao EN-PT"):
+            with st.spinner("Instalando pacote de traducao..."):
+                garantir_argos_en_pt.clear()
+                st.success(garantir_argos_en_pt())
+                st.rerun()
 
     modo_entrada = st.radio(
-        "Escolha a origem do áudio/vídeo",
+        "Escolha a origem do audio/video",
         ["Enviar arquivo", "Usar link"],
         horizontal=True,
     )
@@ -641,44 +18,53 @@ def main() -> None:
 
     if modo_entrada == "Enviar arquivo":
         uploaded = st.file_uploader(
-            "Envie um áudio ou vídeo em inglês",
+            "Envie um audio ou video em ingles",
             type=[
-                "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus",
-                "mp4", "mkv", "mov", "avi", "webm",
+                "mp3",
+                "wav",
+                "m4a",
+                "aac",
+                "flac",
+                "ogg",
+                "opus",
+                "mp4",
+                "mkv",
+                "mov",
+                "avi",
+                "webm",
             ],
         )
 
         if uploaded is None:
-            st.info("Escolha um arquivo para começar.")
+            st.info("Escolha um arquivo para comecar.")
             return
 
         c1, c2, c3 = st.columns(3)
-
-        c1.metric("Arquivo", limpar_texto_tamanho(uploaded.name)[:32])
+        c1.metric("Arquivo", limpar_texto(uploaded.name)[:32])
         c2.metric("Tamanho", f"{uploaded.size / (1024 * 1024):.1f} MB")
         c3.metric("Modelo", model_name)
 
     else:
         link_midia = st.text_input(
-            "Cole o link do áudio ou vídeo",
-            placeholder="https://exemplo.com/audio.mp3",
+            "Cole o link do audio ou video",
+            placeholder="https://www.youtube.com/watch?v=... ou https://site.com/audio.mp3",
         )
+        mostrar_ajuda_youtube()
 
-        st.caption(
-            "⚠️ Sites como YouTube, Instagram, TikTok e Facebook frequentemente "
-            "bloqueiam servidores em cloud. Para usar esses links no Streamlit Cloud, "
-            "adicione um arquivo `cookies.txt` (exportado do navegador) na raiz do projeto. "
-            "Links diretos para arquivos de mídia funcionam sem restrições."
-        )
+        if link_midia.strip() and eh_youtube(link_midia):
+            if COOKIES_FILE.exists():
+                st.success("cookies.txt encontrado. O app vai tentar usar esses cookies no YouTube.")
+            else:
+                st.warning("YouTube detectado. Sem cookies.txt, o Streamlit Cloud pode ser bloqueado.")
 
         if not link_midia.strip():
-            st.info("Cole um link para começar.")
+            st.info("Cole um link para comecar.")
             return
 
-        c1, c2 = st.columns(2)
-
-        c1.metric("Origem", "Link")
-        c2.metric("Modelo", model_name)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Origem", "YouTube" if eh_youtube(link_midia) else "Link")
+        c2.metric("Cookies", "Sim" if COOKIES_FILE.exists() else "Nao")
+        c3.metric("Modelo", model_name)
 
     if not st.button("Transcrever agora", type="primary", use_container_width=True):
         return
@@ -691,13 +77,12 @@ def main() -> None:
         if modo_entrada == "Enviar arquivo":
             temp_path = salvar_upload(uploaded)
             source_name = uploaded.name
-
         else:
-            with st.spinner("Baixando mídia do link..."):
+            with st.spinner("Baixando midia do link..."):
                 temp_path, source_name, temp_dir_link = baixar_midia_link(link_midia)
 
         with st.spinner("Carregando modelo e transcrevendo..."):
-            segments, english_lines, info = transcrever(
+            segments, english_lines, _info = transcrever(
                 temp_path,
                 model_name,
                 device,
@@ -709,20 +94,16 @@ def main() -> None:
         traducao_falhou = False
 
         if traduzir:
-            with st.spinner("Traduzindo para português..."):
+            with st.spinner("Traduzindo para portugues..."):
                 try:
                     portuguese_lines = translate_lines_argos(english_lines)
-
                 except Exception as exc:
                     traducao_falhou = True
-                    portuguese_lines = None
-
                     st.warning(
-                        "A transcrição foi concluída, mas a tradução não pôde "
-                        "ser realizada. Você ainda pode baixar a transcrição em inglês."
+                        "A transcricao foi concluida, mas a traducao nao foi realizada. "
+                        f"Motivo: {exc}"
                     )
 
-        # Geração dos arquivos e previews
         with st.spinner("Gerando arquivos..."):
             files, preview_pt, preview_en = gerar_arquivos(
                 source_name,
@@ -732,48 +113,43 @@ def main() -> None:
                 pause_seconds,
             )
 
-        # Exibição da prévia
-        tab1, tab2 = st.tabs(["🇧🇷 Português", "🇬🇧 Inglês"])
+        tab1, tab2 = st.tabs(["Portugues", "Ingles"])
 
         with tab1:
             if portuguese_lines and not traducao_falhou:
-                st.text_area(
-                    "Tradução",
-                    preview_pt,
-                    height=300,
-                )
+                st.text_area("Traducao", preview_pt, height=320)
             else:
-                st.info("Tradução indisponível.")
+                st.info("Traducao indisponivel.")
 
         with tab2:
-            st.text_area(
-                "Transcrição original",
-                preview_en,
-                height=300,
-            )
+            st.text_area("Transcricao original", preview_en, height=320)
 
-        # Download
-        st.success("Processamento concluído! Baixe os arquivos abaixo.")
+        st.success("Processamento concluido. Baixe os arquivos abaixo.")
 
         for file_path in files:
-            with file_path.open("rb") as f:
+            with file_path.open("rb") as file:
                 st.download_button(
-                    label=f"⬇️ {file_path.name}",
-                    data=f,
+                    label=f"Baixar {file_path.name}",
+                    data=file,
                     file_name=file_path.name,
                     mime="application/octet-stream",
                 )
 
     except Exception as exc:
-        st.error(f"Erro: {exc}")
+        message = str(exc)
+
+        if not mostrar_diagnostico and "Detalhe tecnico do yt-dlp:" in message:
+            message = message.split("Detalhe tecnico do yt-dlp:", maxsplit=1)[0].strip()
+
+        st.error(message)
 
     finally:
-        # Limpeza dos arquivos temporários
         if temp_path and temp_path.exists():
             try:
                 temp_path.unlink()
             except Exception:
                 pass
+
         if temp_dir_link and temp_dir_link.exists():
             shutil.rmtree(temp_dir_link, ignore_errors=True)
 
