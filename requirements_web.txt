@@ -1,4 +1,5 @@
 streamlit
-faster-whisper
 python-docx
+faster-whisper
 argostranslate
+yt-dlp
