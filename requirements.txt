@@ -1,5 +1,5 @@
 streamlit
+python-docx
 faster-whisper
 argostranslate
-python-docx
-huggingface-hub
+yt-dlp
