@@ -2,4 +2,4 @@ streamlit
 python-docx
 faster-whisper
 argostranslate
-yt-dlp
+yt-dlp>=2024.12.13
