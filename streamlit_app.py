@@ -1,10 +1,12 @@
 import re
+import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 import streamlit as st
 from docx import Document
@@ -12,10 +14,11 @@ from faster_whisper import WhisperModel
 
 
 APP_TITLE = "Transcritor"
-VERSION = "v1.1"
+VERSION = "v1.2"
 OUTPUT_DIR = Path("outputs")
+
 SUPPORTED_EXTENSIONS = {
-    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus",
     ".mp4", ".mkv", ".mov", ".avi", ".webm",
 }
 
@@ -55,7 +58,12 @@ def aplicar_estilo() -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def carregar_modelo(model_name: str, device: str, compute_type: str, local_only: bool) -> WhisperModel:
+def carregar_modelo(
+    model_name: str,
+    device: str,
+    compute_type: str,
+    local_only: bool,
+) -> WhisperModel:
     return WhisperModel(
         model_name,
         device=device,
@@ -73,6 +81,61 @@ def salvar_upload(uploaded_file) -> Path:
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
         return Path(tmp.name)
+
+
+def url_valida(url: str) -> bool:
+    parsed = urlparse(url.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def baixar_midia_link(url: str) -> tuple[Path, str, Path]:
+    """
+    Baixa áudio/vídeo de um link usando yt-dlp.
+
+    Retorna:
+    - caminho do arquivo baixado
+    - nome amigável da fonte
+    - diretório temporário para limpeza posterior
+    """
+    if not url_valida(url):
+        raise ValueError("Informe um link válido começando com http:// ou https://.")
+
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError as exc:
+        raise RuntimeError(
+            "yt-dlp não está instalado. Adicione 'yt-dlp' no requirements.txt."
+        ) from exc
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="transcritor_link_"))
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(temp_dir / "%(title).200B.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+    arquivos = [p for p in temp_dir.iterdir() if p.is_file()]
+
+    if not arquivos:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError("Nenhum arquivo foi baixado a partir do link.")
+
+    arquivo_baixado = max(arquivos, key=lambda path: path.stat().st_size)
+
+    source_name = info.get("title") or arquivo_baixado.name
+    source_name = limpar_texto_tamanho(source_name)
+
+    return arquivo_baixado, source_name, temp_dir
 
 
 def transcrever(
@@ -99,7 +162,13 @@ def transcrever(
         if not texto:
             continue
 
-        segmentos.append(Segmento(start=float(segment.start), end=float(segment.end), text=texto))
+        segmentos.append(
+            Segmento(
+                start=float(segment.start),
+                end=float(segment.end),
+                text=texto,
+            )
+        )
         linhas.append(texto)
 
     if not segmentos:
@@ -140,7 +209,8 @@ def garantir_argos_en_pt() -> str:
 
     package = next(
         (
-            pkg for pkg in available_packages
+            pkg
+            for pkg in available_packages
             if pkg.from_code == "en" and pkg.to_code == "pt"
         ),
         None,
@@ -188,6 +258,7 @@ def translate_lines_argos(lines: Iterable[str]) -> list[str]:
         raise RuntimeError(status)
 
     translated: list[str] = []
+
     for line in lines:
         translated.append(translator.translate(line).strip())
 
@@ -228,16 +299,24 @@ def format_srt_time(seconds: float) -> str:
     milliseconds %= 60_000
     secs = milliseconds // 1000
     millis = milliseconds % 1000
+
     return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
 
-def write_srt(path: Path, segments: list[Segmento], lines: list[str] | None = None) -> None:
+def write_srt(
+    path: Path,
+    segments: list[Segmento],
+    lines: list[str] | None = None,
+) -> None:
     with path.open("w", encoding="utf-8") as file:
         for index, segment in enumerate(segments, start=1):
             text = lines[index - 1] if lines and index - 1 < len(lines) else segment.text
 
             file.write(f"{index}\n")
-            file.write(f"{format_srt_time(segment.start)} --> {format_srt_time(segment.end)}\n")
+            file.write(
+                f"{format_srt_time(segment.start)} --> "
+                f"{format_srt_time(segment.end)}\n"
+            )
             file.write(f"{text.strip()}\n\n")
 
 
@@ -277,6 +356,7 @@ def nome_seguro(nome: str) -> str:
     stem = Path(nome).stem
     stem = re.sub(r"[^\w\-. ]+", "", stem, flags=re.UNICODE)
     stem = re.sub(r"\s+", "_", stem).strip("._-")
+
     return stem or "transcricao"
 
 
@@ -295,6 +375,7 @@ def gerar_arquivos(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     english_paragraphs = agrupar_paragrafos(segments, english_lines, pause_seconds)
+
     portuguese_paragraphs = (
         agrupar_paragrafos(segments, portuguese_lines, pause_seconds)
         if portuguese_lines is not None
@@ -326,12 +407,14 @@ def gerar_arquivos(
     created.append(docx_path)
 
     zip_path = out_dir / f"{base}_resultado.zip"
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in created:
             zf.write(path, arcname=path.name)
 
     preview_pt = "\n\n".join(portuguese_paragraphs or [])
     preview_en = "\n\n".join(english_paragraphs)
+
     return [zip_path] + created, preview_pt, preview_en
 
 
@@ -343,12 +426,15 @@ def main() -> None:
     aplicar_estilo()
 
     st.title(f"{APP_TITLE} {VERSION}")
-    st.caption("Transcrição de áudio/vídeo em inglês, tradução para português e geração de legenda.")
+    st.caption(
+        "Transcrição de áudio/vídeo em inglês, tradução para português e geração de legenda."
+    )
+
     st.markdown(
         """
         <div class="hero">
-            <strong>Transcritor online com instalação automática da tradução</strong>
-            <span>Envie um arquivo, transcreva, traduza e baixe TXT, SRT, Word e ZIP.</span>
+            <strong>Transcritor online com suporte a arquivo ou link</strong>
+            <span>Envie um arquivo ou cole um link, transcreva, traduza e baixe TXT, SRT, Word e ZIP.</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -356,13 +442,47 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Configuração")
-        model_name = st.selectbox("Modelo Whisper", ["tiny", "base", "small", "medium"], index=1)
-        device = st.selectbox("Dispositivo", ["cpu", "cuda"], index=0)
-        compute_type = st.selectbox("Precisão", ["int8", "float16", "float32"], index=0)
-        local_only = st.checkbox("Usar somente modelos já baixados", value=False)
-        pause_seconds = st.slider("Pausa para parágrafo", 0.5, 5.0, 0.8, 0.1)
-        traduzir = st.checkbox("Traduzir para português", value=True)
-        instalar_auto = st.checkbox("Instalar tradução EN-PT automaticamente", value=True)
+
+        model_name = st.selectbox(
+            "Modelo Whisper",
+            ["tiny", "base", "small", "medium"],
+            index=1,
+        )
+
+        device = st.selectbox(
+            "Dispositivo",
+            ["cpu", "cuda"],
+            index=0,
+        )
+
+        compute_type = st.selectbox(
+            "Precisão",
+            ["int8", "float16", "float32"],
+            index=0,
+        )
+
+        local_only = st.checkbox(
+            "Usar somente modelos já baixados",
+            value=False,
+        )
+
+        pause_seconds = st.slider(
+            "Pausa para parágrafo",
+            0.5,
+            5.0,
+            0.8,
+            0.1,
+        )
+
+        traduzir = st.checkbox(
+            "Traduzir para português",
+            value=True,
+        )
+
+        instalar_auto = st.checkbox(
+            "Instalar tradução EN-PT automaticamente",
+            value=True,
+        )
 
         if traduzir and instalar_auto:
             try:
@@ -383,27 +503,61 @@ def main() -> None:
                 except Exception as exc:
                     st.error(f"Não foi possível instalar: {exc}")
 
-    uploaded = st.file_uploader(
-        "Envie um áudio ou vídeo em inglês",
-        type=["mp3", "wav", "m4a", "aac", "flac", "ogg", "mp4", "mkv", "mov", "avi", "webm"],
+    modo_entrada = st.radio(
+        "Escolha a origem do áudio/vídeo",
+        ["Enviar arquivo", "Usar link"],
+        horizontal=True,
     )
 
-    if uploaded is None:
-        st.info("Escolha um arquivo para começar.")
-        return
+    uploaded = None
+    link_midia = ""
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Arquivo", limpar_texto_tamanho(uploaded.name)[:32])
-    c2.metric("Tamanho", f"{uploaded.size / (1024 * 1024):.1f} MB")
-    c3.metric("Modelo", model_name)
+    if modo_entrada == "Enviar arquivo":
+        uploaded = st.file_uploader(
+            "Envie um áudio ou vídeo em inglês",
+            type=[
+                "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus",
+                "mp4", "mkv", "mov", "avi", "webm",
+            ],
+        )
+
+        if uploaded is None:
+            st.info("Escolha um arquivo para começar.")
+            return
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Arquivo", limpar_texto_tamanho(uploaded.name)[:32])
+        c2.metric("Tamanho", f"{uploaded.size / (1024 * 1024):.1f} MB")
+        c3.metric("Modelo", model_name)
+
+    else:
+        link_midia = st.text_input(
+            "Cole o link do áudio ou vídeo",
+            placeholder="https://www.youtube.com/watch?v=...",
+        )
+
+        if not link_midia.strip():
+            st.info("Cole um link para começar.")
+            return
+
+        c1, c2 = st.columns(2)
+        c1.metric("Origem", "Link")
+        c2.metric("Modelo", model_name)
 
     if not st.button("Transcrever agora", type="primary", use_container_width=True):
         return
 
     temp_path: Path | None = None
+    temp_dir_link: Path | None = None
+    source_name = ""
 
     try:
-        temp_path = salvar_upload(uploaded)
+        if modo_entrada == "Enviar arquivo":
+            temp_path = salvar_upload(uploaded)
+            source_name = uploaded.name
+        else:
+            with st.spinner("Baixando mídia do link..."):
+                temp_path, source_name, temp_dir_link = baixar_midia_link(link_midia)
 
         with st.spinner("Carregando modelo e transcrevendo..."):
             segments, english_lines, info = transcrever(
@@ -430,7 +584,7 @@ def main() -> None:
                     )
 
         created, preview_pt, preview_en = gerar_arquivos(
-            uploaded.name,
+            source_name,
             segments,
             english_lines,
             portuguese_lines,
@@ -448,6 +602,7 @@ def main() -> None:
         m3.metric("Arquivos", len(created) - 1)
 
         zip_path = created[0]
+
         st.download_button(
             "Baixar tudo em ZIP",
             data=zip_path.read_bytes(),
@@ -474,7 +629,10 @@ def main() -> None:
                 if path.suffix in {".txt", ".srt"}:
                     mime = "text/plain"
                 elif path.suffix == ".docx":
-                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    mime = (
+                        "application/vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document"
+                    )
 
                 st.download_button(
                     label=path.name,
@@ -491,6 +649,12 @@ def main() -> None:
         if temp_path and temp_path.exists():
             try:
                 temp_path.unlink()
+            except OSError:
+                pass
+
+        if temp_dir_link and temp_dir_link.exists():
+            try:
+                shutil.rmtree(temp_dir_link)
             except OSError:
                 pass
 
